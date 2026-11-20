@@ -61,6 +61,7 @@ If `lsusb` lacks `03f0:0580`, the problem is the USB port or cable, not the soft
 | What not to chase again | `docs/06-known-issues.md` |
 | Cable and connector ladder | `docs/22-cable-connector-diagnosis.md` |
 | Controllers and 6DoF | `docs/03-controllers.md`, `docs/125-controller-6dof-root-cause-and-plan.md` |
+| Fedora 44 / stock NVIDIA bring-up, worn head and controller 6DoF tuning | `docs/151-fedora44-head-and-controller-6dof-2026-11-20.md`, `scripts/start-vr-fedora.sh` |
 | Game results via xrizer | `docs/23-game-compatibility.md` |
 | Code review of the tooling and fixes still unverified | `docs/147-full-code-review-2026-10-12.md` |
 

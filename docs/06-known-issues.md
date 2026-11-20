@@ -17,6 +17,9 @@ should spend a minute debugging it.** Two of the four patches are load-bearing f
 
 - **`0004` (bpc)** is the entire 90 Hz fix. Without it the driver clamps the G2 to 6 bpc and the
   panel stays dark at 90 Hz (`docs/13`, `docs/19`). An unpatched driver *cannot* light 90 Hz.
+  (Measured on 595. On 2026-11-20 a stock **615.78.08** on Fedora 44 lit the panel through GNOME's
+  Wayland lease in a 4320x2160 mode at an 11.11 ms period, without `non-desktop=1`; the refresh rate
+  was not checked independently of the log. See `docs/151` §2.)
 - **`0002`** publishes `wp_drm_lease_device_v1` for HMDs and marks the connector `non-desktop=1`.
   Without it there is no Wayland lease path at all, and KWin never offers connectors even *with*
   the patch (measured repeatedly, see `check-lease.sh`). X11 direct-mode is the only possible path

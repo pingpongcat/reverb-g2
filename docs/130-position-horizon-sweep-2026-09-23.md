@@ -1,5 +1,10 @@
 # 130 — SLAM_PRED_POSITION_HORIZON_MS swept offline: a real candidate, not yet worn-confirmed
 
+> **Worn, 2026-11-20 (`docs/151` §4), on a different machine (Fedora 44, 24 threads):** `horizon50`
+> was "much more stable" against the default but froze and then jumped on fast head motion;
+> `horizon100` together with `SLAM_THREADS=8` was "no different from Windows MR". One wearer, no
+> Dalí; the thread count was attributed by `timing.csv`, the horizon by the wearer.
+
 Date: 2026-09-23. Closes the sweep `docs/124` set up (the position-horizon knob had never been
 tested on Dalí) using the offline replay path, no headset needed. The dataset is the one
 validated against a worn run in docs/124. All four configs were replayed serially, at 1x, per the
