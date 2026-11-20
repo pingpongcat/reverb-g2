@@ -1,0 +1,266 @@
+From 72cafe967ab43192027f9f2a3b3bde81dc3edc9e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marcin=20Zaj=C4=85c?= <marcin@pingpongcat.com>
+Date: Fri, 20 Nov 2026 21:19:54 +0100
+Subject: [PATCH 120/120] d/wmr: WMR_CONTROLLER_IMU_BRIDGE_MS: carry the
+ controller through constellation gaps with its IMU
+
+Past the newest solve, report the newest filtered position plus velocity times dt plus the double
+integral of the controller's world-frame linear acceleration (fusion orientation times accel, minus
+gravity, minus a causal mean with WMR_CONTROLLER_IMU_BIAS_S = 0.5 s that absorbs the 3DoF fusion's
+tilt error), for at most WMR_CONTROLLER_IMU_BRIDGE_MS, then hold. The tracker's prior gets the
+same displacement when WMR_CONTROLLER_PRIOR_VELOCITY is on.
+
+Offline on a worn recording (2026-11-20, ~200 Hz IMU, ~80 solves/s), predicting 200 ms ahead from
+constellation position and velocity with the hand above 0.4 m/s: constant velocity p50 2.7 / p90
+9.0 cm, IMU p50 1.7 / p90 6.1 cm. The fitted yaw offset between the fusion world and the tracking
+world was about -5 deg and made no difference, so none is applied. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/wmr/wmr_controller_base.c | 138 +++++++++++++++++++++-
+ src/xrt/drivers/wmr/wmr_controller_base.h |  28 +++++
+ src/xrt/drivers/wmr/wmr_controller_hp.c   |   1 +
+ 3 files changed, 162 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/wmr/wmr_controller_base.c b/src/xrt/drivers/wmr/wmr_controller_base.c
+index 8a46ae0d1..af7bec0cb 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_base.c
++++ b/src/xrt/drivers/wmr/wmr_controller_base.c
+@@ -77,12 +77,110 @@ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_pos_filter_beta, "WMR_CONTROLLER_POS_
+ //! velocity estimate). See constellation_tracking_source_get_tracked_pose.
+ DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_prior_velocity, "WMR_CONTROLLER_PRIOR_VELOCITY", false)
+ 
++//! IMU gap bridging. While no new constellation solve has arrived, carry the position on from the
++//! newest solve with its velocity plus the double integral of the controller's world-frame linear
++//! acceleration, for at most this many ms (0 = off), then hold. Offline on a worn 2026-11-20
++//! recording (200 ms horizon, hand >0.4 m/s), error vs constant velocity: p50 2.7 -> 1.7 cm,
++//! p90 9.0 -> 6.1 cm. Needs the output path (horizon or filter) on.
++DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_imu_bridge_ms, "WMR_CONTROLLER_IMU_BRIDGE_MS", 0)
++//! Time constant of the causal mean subtracted from the world linear acceleration. The 3DoF
++//! fusion's gravity estimate was ~6 deg off on that recording, i.e. ~1 m/s^2 of fake horizontal
++//! acceleration; 0.5 s absorbed it best of 0 / 0.5 / 1.0 s.
++DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_imu_bias_s, "WMR_CONTROLLER_IMU_BIAS_S", 0.5f)
++//! IMU host receive time minus constellation sample time for the same instant. Fitted -8 to -38 ms
++//! on that recording (weakly determined); the bridge is not sensitive to it at this scale.
++DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_imu_time_offset_ms, "WMR_CONTROLLER_IMU_TIME_OFFSET_MS", -15)
++
+ static bool
+ wmr_controller_output_path_enabled(void)
+ {
+ 	return debug_get_num_option_wmr_controller_pos_horizon_ms() > 0 ||
+ 	       debug_get_float_option_wmr_controller_pos_filter_min_cutoff() > 0.0f;
+ }
++
++static bool
++wmr_controller_imu_bridge_enabled(void)
++{
++	return wmr_controller_output_path_enabled() && debug_get_num_option_wmr_controller_imu_bridge_ms() > 0;
++}
++
++void
++wmr_controller_base_push_bridge_imu(struct wmr_controller_base *wcb,
++                                    int64_t host_ns,
++                                    const struct xrt_vec3 *accel,
++                                    const struct xrt_quat *fusion_rot)
++{
++	if (!wmr_controller_imu_bridge_enabled() || wcb->constellation.output_history == NULL) {
++		return;
++	}
++
++	struct xrt_vec3 aw;
++	math_quat_rotate_vec3(fusion_rot, accel, &aw);
++	aw.y -= (float)MATH_GRAVITY_M_S2;
++
++	const float bias_s = debug_get_float_option_wmr_controller_imu_bias_s();
++
++	os_mutex_lock(&wcb->constellation.output_lock);
++	struct wmr_controller_imu_ring *ring = &wcb->constellation.imu_ring;
++	if (ring->last_ts_ns != 0 && host_ns <= ring->last_ts_ns) {
++		os_mutex_unlock(&wcb->constellation.output_lock);
++		return;
++	}
++	if (ring->last_ts_ns == 0) {
++		ring->bias = aw;
++	} else if (bias_s > 0.0f) {
++		float dt = (float)(host_ns - ring->last_ts_ns) / (float)U_TIME_1S_IN_NS;
++		float k = fminf(dt / bias_s, 1.0f);
++		ring->bias = m_vec3_add(ring->bias, m_vec3_mul_scalar(m_vec3_sub(aw, ring->bias), k));
++	}
++	struct xrt_vec3 lin = bias_s > 0.0f ? m_vec3_sub(aw, ring->bias) : aw;
++	const uint32_t cap = ARRAY_SIZE(ring->ts_ns);
++	ring->ts_ns[ring->head] = host_ns;
++	ring->acc[ring->head] = lin;
++	ring->head = (ring->head + 1) % cap;
++	if (ring->count < cap) {
++		ring->count++;
++	}
++	ring->last_ts_ns = host_ns;
++	os_mutex_unlock(&wcb->constellation.output_lock);
++}
++
++/*!
++ * Displacement from @p from_ns to @p to_ns (constellation clock) for a hand moving at @p v0 at
++ * @p from_ns, with the ring's linear acceleration integrated in between. Caller holds output_lock.
++ */
++static struct xrt_vec3
++imu_bridge_displacement_locked(struct wmr_controller_base *wcb, int64_t from_ns, int64_t to_ns, struct xrt_vec3 v0)
++{
++	struct wmr_controller_imu_ring *ring = &wcb->constellation.imu_ring;
++	const uint32_t cap = ARRAY_SIZE(ring->ts_ns);
++	const int64_t offset_ns = (int64_t)debug_get_num_option_wmr_controller_imu_time_offset_ms() * 1000000;
++
++	struct xrt_vec3 dp = {0};
++	struct xrt_vec3 v = v0;
++	int64_t t = from_ns;
++	uint32_t start = (ring->head + cap - ring->count) % cap;
++	for (uint32_t n = 0; n < ring->count; n++) {
++		uint32_t i = (start + n) % cap;
++		int64_t ts = ring->ts_ns[i] - offset_ns;
++		if (ts <= from_ns) {
++			continue;
++		}
++		if (ts > to_ns) {
++			break;
++		}
++		float dt = (float)(ts - t) / (float)U_TIME_1S_IN_NS;
++		struct xrt_vec3 a = ring->acc[i];
++		dp = m_vec3_add(dp, m_vec3_add(m_vec3_mul_scalar(v, dt), m_vec3_mul_scalar(a, 0.5f * dt * dt)));
++		v = m_vec3_add(v, m_vec3_mul_scalar(a, dt));
++		t = ts;
++	}
++	if (to_ns > t) {
++		float dt = (float)(to_ns - t) / (float)U_TIME_1S_IN_NS;
++		dp = m_vec3_add(dp, m_vec3_mul_scalar(v, dt));
++	}
++	return dp;
++}
+ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_gravity_gate_deg, "WMR_CONSTELLATION_GRAVITY_GATE_DEG", 14.0f)
+ 
+ //! World-frame absurdity guard for an arriving constellation sample, in metres (reverb-g2 T223).
+@@ -1120,10 +1218,26 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
+ 			int64_t newest_ns = wcb->constellation.output_last_ts_ns;
+ 			os_mutex_unlock(&wcb->constellation.output_lock);
+ 			int64_t query_ns = at_timestamp_ns;
+-			if (newest_ns != 0 && query_ns > newest_ns + horizon_ns) {
+-				query_ns = newest_ns + horizon_ns;
++			if (wmr_controller_imu_bridge_enabled() && newest_ns != 0 && query_ns > newest_ns) {
++				// Past the newest solve: carry it on with velocity + IMU, at most the bridge
++				// length, instead of the constant-velocity horizon.
++				m_relation_history_get(wcb->constellation.output_history, newest_ns, &constellation_relation);
++				int64_t bridge_ns = (int64_t)debug_get_num_option_wmr_controller_imu_bridge_ms() * 1000000;
++				int64_t to_ns = query_ns < newest_ns + bridge_ns ? query_ns : newest_ns + bridge_ns;
++				os_mutex_lock(&wcb->constellation.output_lock);
++				struct xrt_vec3 v0 = {0};
++				if (wcb->constellation.output_velocity_valid) {
++					v0 = wcb->constellation.output_velocity;
++				}
++				struct xrt_vec3 d = imu_bridge_displacement_locked(wcb, newest_ns, to_ns, v0);
++				os_mutex_unlock(&wcb->constellation.output_lock);
++				constellation_relation.pose.position = m_vec3_add(constellation_relation.pose.position, d);
++			} else {
++				if (newest_ns != 0 && query_ns > newest_ns + horizon_ns) {
++					query_ns = newest_ns + horizon_ns;
++				}
++				m_relation_history_get(wcb->constellation.output_history, query_ns, &constellation_relation);
+ 			}
+-			m_relation_history_get(wcb->constellation.output_history, query_ns, &constellation_relation);
+ 		} else {
+ 			m_relation_history_get(wcb->constellation.relation_history, at_timestamp_ns,
+ 			                       &constellation_relation);
+@@ -2300,6 +2414,17 @@ constellation_tracking_source_get_tracked_pose(struct t_constellation_tracker_tr
+ 		os_mutex_unlock(&wcb->constellation.output_lock);
+ 		if (valid && newest_ns != 0 && when_ns > newest_ns) {
+ 			int64_t ahead_ns = when_ns - newest_ns;
++			if (wmr_controller_imu_bridge_enabled()) {
++				// Same carry-on as the output path, so a reacquisition after a gap is searched
++				// where the IMU says the hand went, not along a straight line.
++				int64_t bridge_ns = (int64_t)debug_get_num_option_wmr_controller_imu_bridge_ms() * 1000000;
++				int64_t to_ns = ahead_ns < bridge_ns ? when_ns : newest_ns + bridge_ns;
++				os_mutex_lock(&wcb->constellation.output_lock);
++				struct xrt_vec3 d = imu_bridge_displacement_locked(wcb, newest_ns, to_ns, v);
++				os_mutex_unlock(&wcb->constellation.output_lock);
++				out_relation->pose.position = m_vec3_add(out_relation->pose.position, d);
++				return;
++			}
+ 			const int64_t max_ahead_ns = 100 * (int64_t)U_TIME_1MS_IN_NS;
+ 			if (ahead_ns > max_ahead_ns) {
+ 				ahead_ns = max_ahead_ns;
+@@ -2460,12 +2585,15 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
+ 		if (wmr_controller_output_path_enabled()) {
+ 			WMR_INFO(wcb,
+ 			         "controller output path ON: horizon %d ms, max speed %d cm/s, velocity tau %d ms, "
+-			         "position one-euro min cutoff %.2f Hz beta %.2f",
++			         "position one-euro min cutoff %.2f Hz beta %.2f, IMU bridge %d ms (bias %.2f s, offset %d ms)",
+ 			         (int)debug_get_num_option_wmr_controller_pos_horizon_ms(),
+ 			         (int)debug_get_num_option_wmr_controller_pos_max_speed_cm_s(),
+ 			         (int)debug_get_num_option_wmr_controller_vel_tau_ms(),
+ 			         (double)debug_get_float_option_wmr_controller_pos_filter_min_cutoff(),
+-			         (double)debug_get_float_option_wmr_controller_pos_filter_beta());
++			         (double)debug_get_float_option_wmr_controller_pos_filter_beta(),
++			         wmr_controller_imu_bridge_enabled() ? (int)debug_get_num_option_wmr_controller_imu_bridge_ms() : 0,
++			         (double)debug_get_float_option_wmr_controller_imu_bias_s(),
++			         (int)debug_get_num_option_wmr_controller_imu_time_offset_ms());
+ 		}
+ 	}
+ 	wcb->constellation.tracking_source.get_tracked_pose = constellation_tracking_source_get_tracked_pose;
+diff --git a/src/xrt/drivers/wmr/wmr_controller_base.h b/src/xrt/drivers/wmr/wmr_controller_base.h
+index b46af5360..3f824f0fc 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_base.h
++++ b/src/xrt/drivers/wmr/wmr_controller_base.h
+@@ -232,6 +232,23 @@ struct wmr_controller_base
+ 		struct xrt_vec3 output_velocity;
+ 		bool output_velocity_valid;
+ 
++		/*!
++		 * WMR_CONTROLLER_IMU_BRIDGE_MS: world-frame linear acceleration (fusion orientation times
++		 * accel, minus gravity, minus a slow causal mean that absorbs the fusion's tilt error),
++		 * one entry per IMU sample, host-clock stamped, newest last. Read by
++		 * wmr_controller_imu_bridge to carry the position through constellation gaps. Guarded
++		 * by output_lock.
++		 */
++		struct wmr_controller_imu_ring
++		{
++			int64_t ts_ns[512];
++			struct xrt_vec3 acc[512];
++			uint32_t head;  //!< index of the next write
++			uint32_t count; //!< valid entries, at most 512
++			struct xrt_vec3 bias;
++			int64_t last_ts_ns;
++		} imu_ring;
++
+ 		/*!
+ 		 * Handed to the tracker as this device's prior (@ref
+ 		 * t_constellation_tracker_device_params.tracking_source), so it can throw out pose
+@@ -303,6 +320,17 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
+ void
+ wmr_controller_base_deinit(struct wmr_controller_base *wcb);
+ 
++/*!
++ * Feed one fused IMU sample to the WMR_CONTROLLER_IMU_BRIDGE_MS ring (no-op while that is off).
++ * Call right after m_imu_3dof_update, with the host receive time and the sample's own device-clock
++ * time (used for the bias filter's dt), from the thread that owns the fusion.
++ */
++void
++wmr_controller_base_push_bridge_imu(struct wmr_controller_base *wcb,
++                                    int64_t host_ns,
++                                    const struct xrt_vec3 *accel,
++                                    const struct xrt_quat *fusion_rot);
++
+ /*!
+  * Apply the optional radial thumbstick deadzone (WMR_STICK_DEADZONE, default 0 =
+  * off) to a raw-scaled stick vector, rescaling so full deflection still reaches
+diff --git a/src/xrt/drivers/wmr/wmr_controller_hp.c b/src/xrt/drivers/wmr/wmr_controller_hp.c
+index e6c159d51..cd6496e2e 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_hp.c
++++ b/src/xrt/drivers/wmr/wmr_controller_hp.c
+@@ -597,6 +597,7 @@ handle_input_packet(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *
+ 
+ 		wcb->last_imu_timestamp_ns = time_ns;
+ 		wcb->last_angular_velocity = ctrl->last_inputs.imu.gyro;
++		wmr_controller_base_push_bridge_imu(wcb, (int64_t)time_ns, &ctrl->last_inputs.imu.acc, &wcb->fusion.rot);
+ 
+ 		if (!ctrl->imu_csv_tried) {
+ 			ctrl->imu_csv_tried = true;
+-- 
+2.56.0
+

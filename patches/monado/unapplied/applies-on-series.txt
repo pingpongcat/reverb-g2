@@ -2,6 +2,9 @@
 # generated 2026-11-11 by rebasing; compile-tested only, NOT headset-validated
 # result: tip tree 029544a6ae34b95c36bf308ba8763e485bba5ce4; 37 listed, all apply with plain git am, monado-service and the full ninja build compile
 # 0015a-0015h, 0074 and 0086 are NEW files: lab-full commits the series never exported, needed as predecessors
+# 2026-11-20: first headset run of 0015a-0113 (Fedora 44, docs/151). 0117-0120 added on top, worn-tested
+# with the left controller on a host BT adapter; full list applies with plain git am, tip tree
+# 19464863a9ece847fd2cc7d8a8d49ab3f18ba957.
 0015a-d-wmr-Build-G2-controller-LED-model-and-register-wit.patch
 0015b-d-wmr-Store-constellation-samples-for-the-debug-GUI-.patch
 0015c-d-wmr-Fuse-constellation-position-into-the-controlle.patch
@@ -40,3 +43,7 @@
 0111-c-constellation-WMR_CONSTELLATION_BLOB_TELEMETRY-blo.patch
 0112-d-wmr-drive-the-LED-pulse-train-for-BT-controllers.patch
 0113-t-constellation-contested-blob-escalation-for-device.patch
+0117-d-wmr-Bounded-prediction-and-one-euro-smoothing-for-.patch
+0118-d-wmr-WMR_CONTROLLER_PRIOR_VELOCITY-shift-the-tracke.patch
+0119-d-wmr-WMR_CONTROLLER_IMU_CSV-dir-log-every-fused-G2-.patch
+0120-d-wmr-WMR_CONTROLLER_IMU_BRIDGE_MS-carry-the-control.patch

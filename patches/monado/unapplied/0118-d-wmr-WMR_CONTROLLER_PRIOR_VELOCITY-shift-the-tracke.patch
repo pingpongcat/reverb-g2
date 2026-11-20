@@ -1,0 +1,81 @@
+From 553a9cffae732e624e929aed97b491ea1a3a956f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marcin=20Zaj=C4=85c?= <marcin@pingpongcat.com>
+Date: Fri, 20 Nov 2026 21:01:19 +0100
+Subject: [PATCH 118/120] d/wmr: WMR_CONTROLLER_PRIOR_VELOCITY: shift the
+ tracker's prior along the estimated hand velocity
+
+Fast motion left the prior several cm behind the hand, so the fast path's LED projection missed
+and the device fell to the slow search. Off by default; needs the output path's velocity estimate.
+Also ignore single solves implying more than twice the speed clamp in that estimate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/wmr/wmr_controller_base.c | 38 ++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/wmr/wmr_controller_base.c b/src/xrt/drivers/wmr/wmr_controller_base.c
+index 2c70188cd..8a46ae0d1 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_base.c
++++ b/src/xrt/drivers/wmr/wmr_controller_base.c
+@@ -73,6 +73,9 @@ DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_vel_tau_ms, "WMR_CONTROLLER_VEL_TAU_MS"
+ //! One-euro filter on the solved position: minimum cutoff in Hz (0 = filter off) and beta.
+ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_pos_filter_min_cutoff, "WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF", 0.0f)
+ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_pos_filter_beta, "WMR_CONTROLLER_POS_FILTER_BETA", 1.0f)
++//! Shift the tracker's prior along the estimated velocity (needs the output path on for the
++//! velocity estimate). See constellation_tracking_source_get_tracked_pose.
++DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_prior_velocity, "WMR_CONTROLLER_PRIOR_VELOCITY", false)
+ 
+ static bool
+ wmr_controller_output_path_enabled(void)
+@@ -1879,7 +1882,16 @@ output_history_push(struct wmr_controller_base *wcb, const struct xrt_pose *raw_
+ 	if (gap_ns <= velocity_gap_ns) {
+ 		double dt = (double)gap_ns / (double)U_TIME_1S_IN_NS;
+ 		struct xrt_vec3 v_inst = m_vec3_div_scalar(m_vec3_sub(pos, wcb->constellation.output_last_pos), (float)dt);
+-		if (wcb->constellation.output_velocity_valid && tau_s > 0.0) {
++		// A single solve implying more than twice the speed clamp is a bad solve (13.7 m/s was
++		// seen in the raw stream on 2026-11-20), not a hand: keep the previous velocity rather
++		// than let one outlier "fling" the prediction or the tracker's prior.
++		bool outlier = max_speed > 0.0 && m_vec3_len(v_inst) > 2.0f * (float)max_speed;
++		if (outlier && wcb->constellation.output_velocity_valid) {
++			// keep output_velocity as it is
++		} else if (outlier) {
++			U_ZERO(&v_inst);
++			wcb->constellation.output_velocity = v_inst;
++		} else if (wcb->constellation.output_velocity_valid && tau_s > 0.0) {
+ 			float alpha = (float)(1.0 - exp(-dt / tau_s));
+ 			struct xrt_vec3 diff = m_vec3_sub(v_inst, wcb->constellation.output_velocity);
+ 			wcb->constellation.output_velocity =
+@@ -2272,6 +2284,30 @@ constellation_tracking_source_get_tracked_pose(struct t_constellation_tracker_tr
+ 	    container_of(tracking_source, struct wmr_controller_base, constellation.tracking_source);
+ 
+ 	m_relation_history_get(wcb->constellation.relation_history, when_ns, out_relation);
++
++	// WMR_CONTROLLER_PRIOR_VELOCITY (default off): the raw history has no velocity, so a prior
++	// asked for at a new camera frame is the previous solve's position. During fast motion that is
++	// several cm behind the hand, the fast path's LED projection from the prior misses, and the
++	// device falls through to the slow search (measured 2026-11-20: gaps after >0.8 m/s motion,
++	// median ~220 ms, ~30 cm jump on return). Shift the prior along the output path's velocity
++	// estimate, at most 100 ms, only while that estimate is valid (no gap > 100 ms behind it).
++	if (debug_get_bool_option_wmr_controller_prior_velocity() && wcb->constellation.output_history != NULL &&
++	    (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
++		os_mutex_lock(&wcb->constellation.output_lock);
++		bool valid = wcb->constellation.output_velocity_valid;
++		struct xrt_vec3 v = wcb->constellation.output_velocity;
++		int64_t newest_ns = wcb->constellation.output_last_ts_ns;
++		os_mutex_unlock(&wcb->constellation.output_lock);
++		if (valid && newest_ns != 0 && when_ns > newest_ns) {
++			int64_t ahead_ns = when_ns - newest_ns;
++			const int64_t max_ahead_ns = 100 * (int64_t)U_TIME_1MS_IN_NS;
++			if (ahead_ns > max_ahead_ns) {
++				ahead_ns = max_ahead_ns;
++			}
++			float ahead_s = (float)ahead_ns / (float)U_TIME_1S_IN_NS;
++			out_relation->pose.position = m_vec3_add(out_relation->pose.position, m_vec3_mul_scalar(v, ahead_s));
++		}
++	}
+ }
+ 
+ /*!
+-- 
+2.56.0
+

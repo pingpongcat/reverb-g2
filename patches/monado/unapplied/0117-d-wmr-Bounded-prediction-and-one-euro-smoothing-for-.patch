@@ -1,0 +1,250 @@
+From fc275929162de9947f0b2b455b326141d889b683 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marcin=20Zaj=C4=85c?= <marcin@pingpongcat.com>
+Date: Fri, 20 Nov 2026 20:52:30 +0100
+Subject: [PATCH 117/120] d/wmr: Bounded prediction and one-euro smoothing for
+ the controller output position
+
+The constellation relation history stores solves without a velocity, so a get_tracked_pose for a
+future display time returned the newest solve unchanged: the hand lagged by the camera latency and
+froze then jumped at every gap between solves. Worn on 2026-11-20 (lamp off, ~120 raw solves/s)
+the raw solve stream had no step over 8 cm and ~1.4 mm p50 jitter, while the wearer saw jitter and
+jumps, which points at the output path rather than the solver.
+
+Add a second, output-only history fed with a one-euro-filtered position and a velocity estimated
+from consecutive solves (exponential smoothing, reset after a 100 ms gap, speed clamp), and query
+it at most WMR_CONTROLLER_POS_HORIZON_MS past the newest solve. The tracker's prior keeps reading
+the raw history. Both gates default off (WMR_CONTROLLER_POS_HORIZON_MS=0,
+WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF=0), which leaves the reported position exactly as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/wmr/wmr_controller_base.c | 139 +++++++++++++++++++++-
+ src/xrt/drivers/wmr/wmr_controller_base.h |  20 ++++
+ 2 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/wmr/wmr_controller_base.c b/src/xrt/drivers/wmr/wmr_controller_base.c
+index b3ff15167..2c70188cd 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_base.c
++++ b/src/xrt/drivers/wmr/wmr_controller_base.c
+@@ -59,6 +59,27 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_full_cal_left, "WMR_CONTROLLER_FULL_CA
+ //! How stale a constellation sample may be before the controller falls back to the placeholder
+ //! pose. See the use site: 200 ms was shorter than the interval samples actually arrive at.
+ DEBUG_GET_ONCE_NUM_OPTION(wmr_constellation_max_age_ms, "WMR_CONSTELLATION_MAX_AGE_MS", 500)
++
++//! Output-only controller position path, see wmr_controller_base.constellation.output_history.
++//! Both gates default off, which keeps the reported position exactly the raw-solve path.
++//! HORIZON_MS: how far past the newest solve the position may be extrapolated with the
++//! estimated velocity (0 = no extrapolation). Same idea as the head's
++//! SLAM_PRED_POSITION_HORIZON_MS (docs/130), which removed the freeze-then-jump on the head.
++DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_pos_horizon_ms, "WMR_CONTROLLER_POS_HORIZON_MS", 0)
++//! Clamp on the estimated hand speed used for extrapolation, in cm/s.
++DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_pos_max_speed_cm_s, "WMR_CONTROLLER_POS_MAX_SPEED_CM_S", 300)
++//! Time constant of the exponential smoothing of the solve-to-solve velocity, in ms.
++DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_vel_tau_ms, "WMR_CONTROLLER_VEL_TAU_MS", 40)
++//! One-euro filter on the solved position: minimum cutoff in Hz (0 = filter off) and beta.
++DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_pos_filter_min_cutoff, "WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF", 0.0f)
++DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_pos_filter_beta, "WMR_CONTROLLER_POS_FILTER_BETA", 1.0f)
++
++static bool
++wmr_controller_output_path_enabled(void)
++{
++	return debug_get_num_option_wmr_controller_pos_horizon_ms() > 0 ||
++	       debug_get_float_option_wmr_controller_pos_filter_min_cutoff() > 0.0f;
++}
+ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_gravity_gate_deg, "WMR_CONSTELLATION_GRAVITY_GATE_DEG", 14.0f)
+ 
+ //! World-frame absurdity guard for an arriving constellation sample, in metres (reverb-g2 T223).
+@@ -1088,8 +1109,22 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
+ 	if (wcb->constellation.tracker != NULL && wcb->constellation.sample_count > 0 &&
+ 	    constellation_sample_age_ns < WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS) {
+ 		struct xrt_space_relation constellation_relation = XRT_SPACE_RELATION_ZERO;
+-		m_relation_history_get(wcb->constellation.relation_history, at_timestamp_ns,
+-		                       &constellation_relation);
++		if (wmr_controller_output_path_enabled() && wcb->constellation.output_history != NULL) {
++			// Filtered history with velocity; cap the extrapolation at the horizon past the
++			// newest solve so a gap coasts briefly and then holds instead of running away.
++			int64_t horizon_ns = (int64_t)debug_get_num_option_wmr_controller_pos_horizon_ms() * 1000000;
++			os_mutex_lock(&wcb->constellation.output_lock);
++			int64_t newest_ns = wcb->constellation.output_last_ts_ns;
++			os_mutex_unlock(&wcb->constellation.output_lock);
++			int64_t query_ns = at_timestamp_ns;
++			if (newest_ns != 0 && query_ns > newest_ns + horizon_ns) {
++				query_ns = newest_ns + horizon_ns;
++			}
++			m_relation_history_get(wcb->constellation.output_history, query_ns, &constellation_relation);
++		} else {
++			m_relation_history_get(wcb->constellation.relation_history, at_timestamp_ns,
++			                       &constellation_relation);
++		}
+ 
+ 		// Position only, deliberately: the orientation in the history is the constellation
+ 		// solve's, and the IMU's (applied further down, under the lock) is better. Taking only
+@@ -1283,6 +1318,10 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
+ 	// After remove_device: the tracker reads this history through the device's tracking_source, so
+ 	// it must not be freed while the tracker can still call in.
+ 	m_relation_history_destroy(&wcb->constellation.relation_history);
++	if (wcb->constellation.output_history != NULL) {
++		m_relation_history_destroy(&wcb->constellation.output_history);
++		os_mutex_destroy(&wcb->constellation.output_lock);
++	}
+ 
+ 	// Remove the variable tracking.
+ 	u_var_remove_root(wcb);
+@@ -1796,6 +1835,87 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
+ 	}
+ }
+ 
++//! Feeds wmr_controller_base.constellation.output_history (see its doc comment). No-op while both
++//! WMR_CONTROLLER_POS_HORIZON_MS and WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF are off.
++static void
++output_history_push(struct wmr_controller_base *wcb, const struct xrt_pose *raw_pose, int64_t ts_ns)
++{
++	if (!wmr_controller_output_path_enabled() || wcb->constellation.output_history == NULL) {
++		return;
++	}
++
++	// A gap this long means the hand was lost: restart the filter instead of smearing the old
++	// position into the new one, and drop the velocity instead of differentiating across the gap.
++	const int64_t filter_reset_gap_ns = 250 * (int64_t)U_TIME_1MS_IN_NS;
++	const int64_t velocity_gap_ns = 100 * (int64_t)U_TIME_1MS_IN_NS;
++
++	const float min_cutoff = debug_get_float_option_wmr_controller_pos_filter_min_cutoff();
++	const double tau_s = (double)debug_get_num_option_wmr_controller_vel_tau_ms() / 1000.0;
++	const double max_speed = (double)debug_get_num_option_wmr_controller_pos_max_speed_cm_s() / 100.0;
++	const bool predict = debug_get_num_option_wmr_controller_pos_horizon_ms() > 0;
++
++	struct xrt_space_relation relation = {0};
++
++	os_mutex_lock(&wcb->constellation.output_lock);
++	int64_t last_ns = wcb->constellation.output_last_ts_ns;
++	if (last_ns != 0 && ts_ns <= last_ns) {
++		// An older solve from another camera thread: the history would reject it anyway, and
++		// feeding it to the filter or the velocity would run time backwards.
++		os_mutex_unlock(&wcb->constellation.output_lock);
++		return;
++	}
++	int64_t gap_ns = last_ns == 0 ? INT64_MAX : ts_ns - last_ns;
++
++	struct xrt_vec3 pos = raw_pose->position;
++	if (min_cutoff > 0.0f) {
++		if (!wcb->constellation.output_filter_primed || gap_ns > filter_reset_gap_ns) {
++			m_filter_euro_vec3_init(&wcb->constellation.output_filter, min_cutoff, 1.0,
++			                        debug_get_float_option_wmr_controller_pos_filter_beta());
++			wcb->constellation.output_filter_primed = true;
++		}
++		m_filter_euro_vec3_run(&wcb->constellation.output_filter, (uint64_t)ts_ns, &raw_pose->position, &pos);
++	}
++
++	if (gap_ns <= velocity_gap_ns) {
++		double dt = (double)gap_ns / (double)U_TIME_1S_IN_NS;
++		struct xrt_vec3 v_inst = m_vec3_div_scalar(m_vec3_sub(pos, wcb->constellation.output_last_pos), (float)dt);
++		if (wcb->constellation.output_velocity_valid && tau_s > 0.0) {
++			float alpha = (float)(1.0 - exp(-dt / tau_s));
++			struct xrt_vec3 diff = m_vec3_sub(v_inst, wcb->constellation.output_velocity);
++			wcb->constellation.output_velocity =
++			    m_vec3_add(wcb->constellation.output_velocity, m_vec3_mul_scalar(diff, alpha));
++		} else {
++			wcb->constellation.output_velocity = v_inst;
++		}
++		float speed = m_vec3_len(wcb->constellation.output_velocity);
++		if (max_speed > 0.0 && speed > (float)max_speed) {
++			wcb->constellation.output_velocity =
++			    m_vec3_mul_scalar(wcb->constellation.output_velocity, (float)max_speed / speed);
++		}
++		wcb->constellation.output_velocity_valid = true;
++	} else {
++		U_ZERO(&wcb->constellation.output_velocity);
++		wcb->constellation.output_velocity_valid = false;
++	}
++
++	wcb->constellation.output_last_pos = pos;
++	wcb->constellation.output_last_ts_ns = ts_ns;
++
++	relation.pose.position = pos;
++	relation.pose.orientation = raw_pose->orientation;
++	relation.relation_flags = (enum xrt_space_relation_flags)(
++	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
++	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
++	if (predict && wcb->constellation.output_velocity_valid) {
++		relation.linear_velocity = wcb->constellation.output_velocity;
++		relation.relation_flags =
++		    (enum xrt_space_relation_flags)(relation.relation_flags | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
++	}
++	os_mutex_unlock(&wcb->constellation.output_lock);
++
++	m_relation_history_push(wcb->constellation.output_history, &relation, ts_ns);
++}
++
+ //! @ref t_constellation_tracker_device::push_constellation_tracker_sample. Feeds @ref
+ //! wmr_controller_base.constellation.relation_history, which is what both the reported position and
+ //! the tracker's own prior are read from. The last_* fields below are kept for the debug GUI.
+@@ -2046,6 +2166,7 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
+ 	        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT),
+ 	};
+ 	m_relation_history_push(wcb->constellation.relation_history, &relation, sample->timestamp_ns);
++	output_history_push(wcb, &sample->pose, sample->timestamp_ns);
+ 
+ 	wcb->constellation.last_pose = sample->pose;
+ 	wcb->constellation.last_timestamp_ns = sample->timestamp_ns;
+@@ -2297,6 +2418,20 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
+ 	if (wcb->constellation.relation_history == NULL) {
+ 		m_relation_history_create(&wcb->constellation.relation_history);
+ 	}
++	if (wcb->constellation.output_history == NULL) {
++		os_mutex_init(&wcb->constellation.output_lock);
++		m_relation_history_create(&wcb->constellation.output_history);
++		if (wmr_controller_output_path_enabled()) {
++			WMR_INFO(wcb,
++			         "controller output path ON: horizon %d ms, max speed %d cm/s, velocity tau %d ms, "
++			         "position one-euro min cutoff %.2f Hz beta %.2f",
++			         (int)debug_get_num_option_wmr_controller_pos_horizon_ms(),
++			         (int)debug_get_num_option_wmr_controller_pos_max_speed_cm_s(),
++			         (int)debug_get_num_option_wmr_controller_vel_tau_ms(),
++			         (double)debug_get_float_option_wmr_controller_pos_filter_min_cutoff(),
++			         (double)debug_get_float_option_wmr_controller_pos_filter_beta());
++		}
++	}
+ 	wcb->constellation.tracking_source.get_tracked_pose = constellation_tracking_source_get_tracked_pose;
+ 	wcb->constellation.tracking_source.get_trusted_orientation = constellation_tracking_source_get_trusted_orientation;
+ 	wcb->constellation.tracking_source.get_trusted_gravity = constellation_tracking_source_get_trusted_gravity;
+diff --git a/src/xrt/drivers/wmr/wmr_controller_base.h b/src/xrt/drivers/wmr/wmr_controller_base.h
+index a5623d99f..b46af5360 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_base.h
++++ b/src/xrt/drivers/wmr/wmr_controller_base.h
+@@ -17,6 +17,7 @@
+ #include "os/os_threading.h"
+ #include "math/m_imu_3dof.h"
+ #include "math/m_relation_history.h"
++#include "math/m_filter_one_euro.h"
+ #include "util/u_device.h"
+ #include "util/u_logging.h"
+ #include "xrt/xrt_device.h"
+@@ -212,6 +213,25 @@ struct wmr_controller_base
+ 		 */
+ 		struct m_relation_history *relation_history;
+ 
++		/*!
++		 * Output-only position path (WMR_CONTROLLER_POS_HORIZON_MS and
++		 * WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF, both default off). @ref relation_history stores
++		 * solves without a velocity, so a query for a future display time returns the last solve
++		 * unchanged: the hand lags by the whole camera latency and steps at every gap. This second
++		 * history carries a one-euro-filtered position plus a velocity estimated from consecutive
++		 * solves, and get_tracked_pose extrapolates it at most WMR_CONTROLLER_POS_HORIZON_MS past the
++		 * newest solve. Kept separate so the tracker's prior (tracking_source) still reads raw solves.
++		 * All fields below are guarded by output_lock: several camera threads deliver solves.
++		 */
++		struct m_relation_history *output_history;
++		struct os_mutex output_lock;
++		struct m_filter_euro_vec3 output_filter;
++		bool output_filter_primed;
++		int64_t output_last_ts_ns;
++		struct xrt_vec3 output_last_pos;
++		struct xrt_vec3 output_velocity;
++		bool output_velocity_valid;
++
+ 		/*!
+ 		 * Handed to the tracker as this device's prior (@ref
+ 		 * t_constellation_tracker_device_params.tracking_source), so it can throw out pose
+-- 
+2.56.0
+

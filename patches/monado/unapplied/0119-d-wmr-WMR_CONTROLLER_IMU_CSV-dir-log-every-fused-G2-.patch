@@ -1,0 +1,66 @@
+From 32c16a49cbdd2d6a364e6e7b7011233dde2a9c14 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marcin=20Zaj=C4=85c?= <marcin@pingpongcat.com>
+Date: Fri, 20 Nov 2026 21:09:51 +0100
+Subject: [PATCH 119/120] d/wmr: WMR_CONTROLLER_IMU_CSV=<dir>: log every fused
+ G2 controller IMU sample
+
+Host and device timestamps, raw accel/gyro and the fusion orientation, one CSV per hand, to check
+offline whether accelerometer dead reckoning can bridge constellation gaps. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/wmr/wmr_controller_hp.c | 31 +++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/xrt/drivers/wmr/wmr_controller_hp.c b/src/xrt/drivers/wmr/wmr_controller_hp.c
+index 8fa459312..e6c159d51 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_hp.c
++++ b/src/xrt/drivers/wmr/wmr_controller_hp.c
+@@ -239,6 +239,11 @@ struct wmr_controller_hp
+ 	//! True while the IMU fields are idle zeros: the fusion clock has not advanced since.
+ 	bool imu_idle;
+ 
++	//! WMR_CONTROLLER_IMU_CSV=<dir>: one CSV per hand of every fused IMU sample, for checking
++	//! offline whether accelerometer dead reckoning can bridge constellation gaps.
++	FILE *imu_csv;
++	bool imu_csv_tried;
++
+ 	//! True once last_inputs.battery has been set at least once by a real packet -- guards
+ 	//! get_battery_status() from reporting a fake 0% before the controller has said anything.
+ 	bool has_battery_sample;
+@@ -592,6 +597,32 @@ handle_input_packet(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *
+ 
+ 		wcb->last_imu_timestamp_ns = time_ns;
+ 		wcb->last_angular_velocity = ctrl->last_inputs.imu.gyro;
++
++		if (!ctrl->imu_csv_tried) {
++			ctrl->imu_csv_tried = true;
++			const char *dir = getenv("WMR_CONTROLLER_IMU_CSV");
++			if (dir != NULL && dir[0] != '\0') {
++				char path[512];
++				snprintf(path, sizeof(path), "%s/imu-%s.csv", dir,
++				         wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "left" : "right");
++				ctrl->imu_csv = fopen(path, "w");
++				if (ctrl->imu_csv != NULL) {
++					setvbuf(ctrl->imu_csv, NULL, _IOLBF, 0); // survive SIGTERM
++					fprintf(ctrl->imu_csv, "host_ns,dev_ns,ax,ay,az,gx,gy,gz,qx,qy,qz,qw\n");
++					WMR_INFO(ctrl, "IMU CSV: %s", path);
++				} else {
++					WMR_ERROR(ctrl, "IMU CSV: cannot open %s", path);
++				}
++			}
++		}
++		if (ctrl->imu_csv != NULL) {
++			const struct xrt_vec3 *a = &ctrl->last_inputs.imu.acc;
++			const struct xrt_vec3 *g = &ctrl->last_inputs.imu.gyro;
++			const struct xrt_quat *q = &wcb->fusion.rot;
++			fprintf(ctrl->imu_csv, "%" PRIu64 ",%" PRIu64 ",%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f\n",
++			        time_ns, ctrl->last_inputs.imu.timestamp_ticks * WMR_MOTION_CONTROLLER_NS_PER_TICK,
++			        a->x, a->y, a->z, g->x, g->y, g->z, q->x, q->y, q->z, q->w);
++		}
+ 	}
+ 
+ 	return b;
+-- 
+2.56.0
+

@@ -136,9 +136,10 @@ message of each patch lists its variables and the measurement behind it.
 
 ## `unapplied/`: controller 6DoF work in progress
 
-38 patches that are **not part of the build**, and that nothing reads: `0015a-0015h` (new),
+42 patches that are **not part of the build**, and that nothing reads: `0015a-0015h` (new),
 `0016 0017 0024 0025 0027 0028 0030 0032 0034 0047 0048 0066 0067 0070 0074 (new) 0076 0077
-0078 0082 0084 0085 0086 (new) 0088 0107 0108 0109 0110 0111 0112 0113`. They were developed on
+0078 0082 0084 0085 0086 (new) 0088 0107 0108 0109 0110 0111 0112 0113`, and `0117-0120`
+(2026-11-20, see below). They were developed on
 a lab branch (`lab-full`) whose history diverges from 0012-0017 above and that was never
 published. They cover the second half of controller position tracking: registering the
 controllers with the tracker, tracking origin and relation history, the yaw-ghost defenses
@@ -167,6 +168,28 @@ rebase changed:
   `receive_ctrl_cam` that 0017 fixes.
 - The files are the rebased versions. The lab-full originals were replaced.
 
+### First headset run, and 0117-0120 (2026-11-20, `docs/151`)
+
+The whole `unapplied/` list ran on a G2 for the first time on 2026-11-20 (Fedora 44, stock NVIDIA
+615, left controller on a host Bluetooth adapter), built as a separate worktree next to the
+applied series. With the PWM desk lamp in view the tracker got 0.2 solves/s; with it off, 120/s
+and 97% of reported poses tracked on a static desk scene. Four patches were added on top and
+worn-tested one at a time; all default off:
+
+| Patch | What | Worn result / measurement |
+|---|---|---|
+| 0117 | Output-only position history: one-euro filter + velocity estimate, bounded prediction (`WMR_CONTROLLER_POS_HORIZON_MS`, `WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF`, `_BETA`) | "clearly better": the raw solve stream had no step > 8 cm, the jumps came from the output path holding the last solve |
+| 0118 | `WMR_CONTROLLER_PRIOR_VELOCITY`: the tracker's prior is shifted along that velocity (≤ 100 ms) | "best run so far"; numbers not a clean win (the motion differed between runs) |
+| 0119 | `WMR_CONTROLLER_IMU_CSV=<dir>`: per-sample IMU log for offline work | instrument only |
+| 0120 | `WMR_CONTROLLER_IMU_BRIDGE_MS`: carry the position through solve gaps with velocity + double-integrated world acceleration | "could not break tracking even with fast swings"; offline, 200 ms ahead at > 0.4 m/s: p90 9.0 cm (constant velocity) → 6.1 cm |
+
+Settings used for the best run: `WMR_CONTROLLER_POS_HORIZON_MS=50
+WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF=0.7 WMR_CONTROLLER_POS_FILTER_BETA=3
+WMR_CONTROLLER_PRIOR_VELOCITY=1 WMR_CONTROLLER_IMU_BRIDGE_MS=250
+WMR_CONTROLLER_CAM_EXPOSURE_US=3000 WMR_CONTROLLER_CAM_GAIN=200`. One wearer, one controller, one
+room: this is the first data point, not a validation. Remaining: the hand can still outrun the
+geometry on very fast motion, and rarely a single frame jumps while the controller is held still.
+
 ## Known issues
 
 - **0015 is applied, but it carries the values that 0016 corrects.** 0015 uses controller
@@ -179,6 +202,12 @@ rebase changed:
   is unreliable.
 - 0012-0015 and 0024-0035 come from two diverging histories. The rebased `unapplied/` set
   resolves that, but only on paper, until the A/B above has been done.
+- **On a fresh clone, the "2 need the 3-way fallback" patches (0083 and 0098) fail even with
+  `git am -3`** ("could not build fake ancestor": the blobs they reference only exist in the
+  history they were made on). Their context comes from `unapplied/0016` (gain `100`) and from a
+  later comment rewrite; the code change itself applies with `patch -p1` at fuzz 1. Done that way
+  on 2026-11-20 the resulting tree was `3efadad4c…`, exactly the tip tree `unapplied/` expects
+  (`docs/151`). `bootstrap-lab.sh` does not have this fallback yet.
 
 ## Upstream status
 
