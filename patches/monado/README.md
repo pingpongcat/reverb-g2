@@ -186,8 +186,10 @@ worn-tested one at a time; all default off:
 Settings used for the best run: `WMR_CONTROLLER_POS_HORIZON_MS=50
 WMR_CONTROLLER_POS_FILTER_MIN_CUTOFF=0.7 WMR_CONTROLLER_POS_FILTER_BETA=3
 WMR_CONTROLLER_PRIOR_VELOCITY=1 WMR_CONTROLLER_IMU_BRIDGE_MS=250
-WMR_CONTROLLER_CAM_EXPOSURE_US=3000 WMR_CONTROLLER_CAM_GAIN=200`. One wearer, one controller, one
-room: this is the first data point, not a validation. Remaining: the hand can still outrun the
+WMR_CONTROLLER_CAM_EXPOSURE_US=3000 WMR_CONTROLLER_CAM_GAIN=200`, in a dark room. With a lamp in
+view 3000/200 collapsed to 3.6 solves/s against 245/s at the default 6000/100 (2026-11-21, both
+controllers on the headset radio, `docs/151` §8), so keep 6000/100. One wearer, one room: this is
+the first data point, not a validation. Remaining: the hand can still outrun the
 geometry on very fast motion, and rarely a single frame jumps while the controller is held still.
 
 ## Known issues

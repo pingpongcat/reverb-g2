@@ -25,7 +25,8 @@
 #   output path (unapplied/0117): bounded prediction + one-euro, 0.7 Hz / beta 3 (offline
 #     replay: slow-motion jitter p50 1.06 -> 0.64 mm vs 1.5/10, a few mm more lag mid-speed);
 #   prior velocity (0118); IMU gap bridge 250 ms (0120);
-#   exposure 3000 us / gain 200 (less motion blur than 6000/100).
+#   exposure 6000 us / gain 100: 3000/200 helped in a dark room (less blur) but with a lamp in
+#   view it raised blobs to 125-250 per frame (3.6 solves/s vs 245/s at 6000/100, 2026-11-21).
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export VR_BASE="${VR_BASE:-$HOME/vr}"
@@ -49,8 +50,8 @@ up|demo|ctrl|ctrl-demo)
 			WMR_CONTROLLER_POS_FILTER_BETA="${WMR_CONTROLLER_POS_FILTER_BETA:-3}"
 			WMR_CONTROLLER_IMU_BRIDGE_MS="${WMR_CONTROLLER_IMU_BRIDGE_MS:-250}"
 			WMR_CONTROLLER_PRIOR_VELOCITY="${WMR_CONTROLLER_PRIOR_VELOCITY:-1}"
-			WMR_CONTROLLER_CAM_EXPOSURE_US="${WMR_CONTROLLER_CAM_EXPOSURE_US:-3000}"
-			WMR_CONTROLLER_CAM_GAIN="${WMR_CONTROLLER_CAM_GAIN:-200}"
+			WMR_CONTROLLER_CAM_EXPOSURE_US="${WMR_CONTROLLER_CAM_EXPOSURE_US:-6000}"
+			WMR_CONTROLLER_CAM_GAIN="${WMR_CONTROLLER_CAM_GAIN:-100}"
 		)
 	fi
 	rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/monado_comp_ipc"

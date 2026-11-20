@@ -245,8 +245,10 @@ with the controller held still, the geometry jumps to a slightly different place
 ## 6. How to run it
 
 `scripts/start-vr-fedora.sh [up|demo|ctrl|ctrl-demo|down]` carries every setting above (head: 8 threads +
-100 ms horizon; `ctrl`: the `~/vr/monado-ctrl` build with 0117-0120 at the best-run values and
-3000/200). Environment values override its defaults. `demo` modes run `hello_xr` through
+100 ms horizon; `ctrl`: the `~/vr/monado-ctrl` build with 0117-0120 at the best-run values; the
+controller-camera exposure default went back to 6000/100 on 2026-11-21, §8). Environment values
+override its defaults; with the controllers on the headset radio but stale host bonds still in
+BlueZ, add `VR_BT_CTRL_CHECK=0` (§8). `demo` modes run `hello_xr` through
 `scripts/ctrl-tracking/demo-loop.sh`, because the controller's Windows/Menu button ends `hello_xr`'s
 session and that button sits under the thumb.
 
@@ -265,5 +267,57 @@ summarise with `analyze.py`), `gaps.py` (gaps vs hand speed), `imu_bridge_check.
    the "outrun on very fast motion".
 3. The LED pulse train synchronised to the exposure (`docs/126` §3-4, `docs/143`), the only fix for
    lamps in view.
-4. The right controller, and the left one on the headset radio under Windows/Oasis for a native
-   comparison on the same hardware.
+4. ~~The right controller, and the left one on the headset radio under Windows/Oasis for a native
+   comparison on the same hardware.~~ Done, §8.
+
+## 8. Follow-up, 2026-11-21: both controllers on the headset radio, and a native Windows comparison
+
+**Pairing.** Both controllers were paired under Windows with Oasis. The wearer was not sure whether
+Oasis used the host adapter or the headset radio; `scripts/controller-pair-check.py` on Linux settled
+it: `left (id 0): paired`, `right (id 1): paired` on the **headset radio** (on 2026-11-20 both read
+`UNPAIRED`). After a press of the Windows button both went `online` within ~30 s, and Monado created
+both through the tunnel (`left: HP Reverb G2 Left Controller`, `right: HP Reverb G2 Right Controller`),
+including the right one that never connected over the host adapter. Tunnelled IMU rate, from the 0119
+CSVs: 187 Hz (left) and 199 Hz (right), the same as over the host adapter.
+
+**Launcher trap.** BlueZ still held the two stale host-adapter bonds, so the launcher's host-BT
+guard counts "2 bonded" and waits for them. They now talk through the headset, so the guard can
+never be satisfied. Launch with `VR_BT_CTRL_CHECK=0`, or remove the stale bonds from BlueZ.
+
+**The lamp again, made worse by gain.** First worn run: both cubes sat near the face and only
+rotated. Same desk lamp lit, `start-vr-fedora.sh ctrl` defaults of that day (3000 µs / gain 200):
+
+| Controller-camera exposure / gain, lamp **on** | blobs per frame (p50 range across cameras, p90 max) | raw solves/s, both hands | `get_tracked_pose` tracked |
+|---|---|---|---|
+| 3000 / 200 | 125-165, p90 250 (the cap) | 3.6 | 7% |
+| 6000 / 100 | 11-18 in three cameras, 104 in the fourth | 245 (~123 per hand) | 67% |
+
+Gain 200 had looked better in a dark room on 2026-11-20 (§5.5: less blur), but it lifts ambient light
+and sensor noise into blobs as well; with any lamp in view it is far worse than 6000/100. **The
+default is back to 6000/100.** Lamp off, 6000/100, worn: **"both controllers lock on very quickly and
+work as well as in the last session: no breaks, jumps only on very fast motion; slow-motion stability
+seems very good."**
+
+Unverified observation: with the lamp on at 6000/100 the tunnelled controllers got 245 solves/s, the
+host-adapter one on 2026-11-20 got 0.2-0.6/s. The rooms were the same but the head pose and the
+lamp's position in the cameras' view were not controlled, so this is not yet a transport effect. A
+possible mechanism to test: the headset driving the LEDs of its own tunnelled controllers.
+
+**Native Windows comparison (wearer, SteamVR + Oasis, both controllers on the headset radio):**
+
+- Very fast swings do not disturb tracking at all. "Incomparably better" than this patch set on
+  fast motion; this is now the main gap.
+- The controller model still occasionally jumps to another place on Windows too, so the one-frame
+  jumps of §5.7 are not obviously Linux-only.
+- SteamVR's pointer ray from the controller is very stable. A ray mostly shows orientation error
+  (it grows with ray length) while a few cm of position error only shifts it sideways, and the
+  orientation comes from the gyro; SteamVR may also smooth it. Not measured.
+
+**Next (agreed with the wearer):** a small demo app of our own, built on this repo's `hello_xr`
+(`patches/hello_xr-player`), that reacts to the buttons and draws a pointer ray from each controller,
+for a direct comparison with the Windows ray and to separate position from orientation error. Then
+the complementary filter of §7 item 2 for fast motion.
+
+Process note: `pgrep -f '[d]emo-loop'` and `ps | awk '/[d]emo-loop/'` both matched the shell that ran
+them (its own command line contained `scripts/ctrl-tracking/demo-loop.sh`) and killed it, twice.
+The script runs under its own name, so `pgrep -x demo-loop.sh` is the safe match.
